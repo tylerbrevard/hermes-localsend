@@ -57,6 +57,16 @@ SEND = {
                 "type": "string",
                 "description": "PIN required by the receiver, if any. Defaults to the configured localsend pin.",
             },
+            "scheme": {
+                "type": "string",
+                "enum": ["http", "https"],
+                "description": (
+                    "Transport to use when 'peer' is a bare address and discovery did not report one. "
+                    "Use https for LocalSend devices in their default encrypted mode — the plugin "
+                    "presents its own certificate and verifies the peer's against the advertised fingerprint. "
+                    "Peers found via localsend_discover carry their own transport and need no scheme."
+                ),
+            },
         },
     },
 }

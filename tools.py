@@ -14,13 +14,14 @@ import threading
 import time
 from typing import Any, Optional
 
-from . import protocol
+from . import certs, protocol
 from .protocol import DeviceInfo, LocalSendError, Peer, ReceiveServer
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_ALIAS_PREFIX = "Hermes"
 DEFAULT_INBOX = os.path.join("~", "Downloads", "LocalSend")
+DEFAULT_IDENTITY_DIR = os.path.join("~", ".hermes", "localsend-identity")
 
 # Receiver is a process-wide singleton: one port, one inbox per Hermes process.
 _receiver: Optional[ReceiveServer] = None
@@ -48,6 +49,7 @@ class LocalSendTools:
     def __init__(self, ctx: Any, settings: dict[str, Any]):
         self.ctx = ctx
         self.settings = settings
+        self._identity: Optional[certs.Identity] = None
 
     # -- helpers -----------------------------------------------------------
     @property
@@ -76,6 +78,19 @@ class LocalSendTools:
     def pin_default(self) -> str:
         return str(self.settings.get("pin") or "").strip()
 
+    @property
+    def identity_dir(self) -> str:
+        configured = str(self.settings.get("identity_dir") or "").strip()
+        return os.path.expanduser(configured or DEFAULT_IDENTITY_DIR)
+
+    def identity(self) -> certs.Identity:
+        """Device certificate for HTTPS peers (created on first use)."""
+        if self._identity is None:
+            self._identity = certs.generate(self.identity_dir)
+            protocol.set_identity(self._identity)
+            logger.info("localsend: device identity %s", self._identity.fingerprint)
+        return self._identity
+
     def _fingerprint(self) -> str:
         """Stable per-profile device fingerprint (peers remember devices by it)."""
         state = getattr(self.ctx, "state", None)
@@ -93,12 +108,18 @@ class LocalSendTools:
             return fresh
         return protocol.DeviceInfo().fingerprint
 
-    def device_info(self, alias: str = "", port: int = 0, protocol_name: str = "http") -> DeviceInfo:
+    def device_info(
+        self,
+        alias: str = "",
+        port: int = 0,
+        protocol_name: str = "http",
+        fingerprint: str = "",
+    ) -> DeviceInfo:
         return DeviceInfo(
             alias=alias or self.alias_default,
             deviceType=default_device_type(),
             deviceModel=default_device_model(),
-            fingerprint=self._fingerprint(),
+            fingerprint=fingerprint or self._fingerprint(),
             port=port or self.port_default,
             protocol=protocol_name,
             download=False,
@@ -223,14 +244,27 @@ class LocalSendTools:
                         peers=[p.get("alias") for p in discovered],
                     )
 
+        scheme = str(args.get("scheme") or "").strip().lower()
+        if scheme and scheme not in {"http", "https"}:
+            return self._err(f"scheme must be http or https, got '{scheme}'")
         try:
-            peer = self._resolve_peer(target, discovered)
+            peer = self._resolve_peer(target, discovered, scheme=scheme)
         except LocalSendError as exc:
             return self._err(str(exc), peers=[p.get("alias") for p in discovered])
 
+        # Encrypted peers identify us by the certificate we present, not by the
+        # random HTTP-mode fingerprint, so load the device identity first and pin
+        # the peer's certificate against the fingerprint it announced.
+        fingerprint = ""
+        identity_note = ""
         if peer.protocol == "https":
             try:
-                protocol.verify_peer_certificate(peer)
+                identity = self.identity()
+                protocol.set_identity(identity)
+                fingerprint = identity.fingerprint
+                identity_note = protocol.verify_peer_certificate(peer)
+            except certs.IdentityError as exc:
+                return self._err(f"cannot prepare the device certificate: {exc}", peer=peer.as_dict())
             except LocalSendError as exc:
                 return self._err(str(exc), peer=peer.as_dict())
 
@@ -238,7 +272,11 @@ class LocalSendTools:
             result = protocol.send_files(
                 peer,
                 paths,
-                self.device_info(port=self.port_default),
+                self.device_info(
+                    port=self.port_default,
+                    protocol_name=peer.protocol,
+                    fingerprint=fingerprint,
+                ),
                 pin=pin,
                 timeout=float(self.settings.get("send_timeout_s") or 120),
             )
@@ -249,9 +287,13 @@ class LocalSendTools:
 
         result["peer"] = peer.as_dict()
         result["text_file"] = paths[-1] if text else None
+        if fingerprint:
+            result["identity_fingerprint"] = fingerprint
+        if identity_note:
+            result["note"] = identity_note
         return self._ok(result)
 
-    def _resolve_peer(self, target: str, discovered: list[dict[str, Any]]) -> Peer:
+    def _resolve_peer(self, target: str, discovered: list[dict[str, Any]], scheme: str = "") -> Peer:
         """Match 'alias' | ip | ip:port against discovery results (or use it directly)."""
         needle = target.strip().strip("'\"").lower()
         if not needle:
@@ -272,18 +314,20 @@ class LocalSendTools:
                 )
         for item in discovered:  # substring alias match
             if needle and needle in str(item.get("alias", "")).lower():
-                return self._resolve_peer(str(item["alias"]), discovered)
+                return self._resolve_peer(str(item["alias"]), discovered, scheme=scheme)
 
         if not discovered:
             fresh = self._scan_now(self.port_default, True)
             if fresh:
-                return self._resolve_peer(target, [p.as_dict() for p in fresh])
+                return self._resolve_peer(target, [p.as_dict() for p in fresh], scheme=scheme)
 
         # Direct address form: ip or ip:port (no discovery needed)
         host, _, port_text = needle.partition(":")
         if host.count(".") == 3 and all(part.isdigit() for part in host.split(".")):
             port = int(port_text) if port_text.isdigit() else self.port_default
-            return Peer(alias=needle, ip=host, port=port, protocol="http", source="direct")
+            # A directly addressed peer has no advertisement to read the transport
+            # from, so it must be stated; HTTP stays the default.
+            return Peer(alias=needle, ip=host, port=port, protocol=scheme or "http", source="direct")
 
         known = ", ".join(f"{p.get('alias')} ({p.get('ip')})" for p in discovered) or "none"
         raise LocalSendError(f"no LocalSend device matched '{target}'. Currently visible: {known}")

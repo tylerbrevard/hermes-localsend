@@ -30,6 +30,21 @@ from urllib.parse import parse_qs, urlparse
 logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "2.2"
+
+# Device identity used when talking to peers in encrypted (HTTPS) mode. LocalSend
+# requires a client certificate there, and identifies us by the certificate's
+# SHA-256 fingerprint, so the announced fingerprint must be this certificate's.
+_identity = None
+
+
+def set_identity(identity) -> None:
+    """Register the certificate presented to HTTPS peers (module-level, per process)."""
+    global _identity
+    _identity = identity
+
+
+def get_identity():
+    return _identity
 MULTICAST_GROUP = "224.0.0.167"
 MULTICAST_PORT = 53317
 DEFAULT_PORT = 53317
@@ -143,13 +158,18 @@ def _peer_from_payload(payload: dict[str, Any], ip: str, source: str = "http") -
 # --------------------------------------------------------------------------
 
 
-def _ssl_context(insecure: bool = True) -> ssl.SSLContext:
+def _ssl_context(insecure: bool = True, identity=None) -> ssl.SSLContext:
     ctx = ssl.create_default_context()
     if insecure:
         # LocalSend peers use self-signed certificates; the fingerprint is the
         # identity check, not the CA chain.
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+    # Present our client certificate: v2 receivers make client auth mandatory and
+    # reject the handshake outright without one (tlsv13 "certificate required").
+    identity = identity if identity is not None else _identity
+    if identity is not None:
+        ctx.load_cert_chain(identity.cert_path, identity.key_path)
     return ctx
 
 
@@ -157,6 +177,17 @@ def _connection(peer: Peer, timeout: float) -> http.client.HTTPConnection:
     if peer.protocol == "https":
         return http.client.HTTPSConnection(peer.ip, peer.port, timeout=timeout, context=_ssl_context())
     return http.client.HTTPConnection(peer.ip, peer.port, timeout=timeout)
+
+
+def peer_certificate_fingerprint(peer: Peer, timeout: float = 5.0) -> str:
+    """The peer's certificate fingerprint as LocalSend advertises it (uppercase hex)."""
+    ctx = _ssl_context()
+    with socket.create_connection((peer.ip, peer.port), timeout=timeout) as raw_sock:
+        with ctx.wrap_socket(raw_sock, server_hostname=peer.ip) as tls_sock:
+            der = tls_sock.getpeercert(binary_form=True)
+    if not der:
+        return ""
+    return hashlib.sha256(der).hexdigest().upper()
 
 
 def _request_json(
@@ -523,7 +554,11 @@ def cancel_session(peer: Peer, session_id: str, timeout: float = 10.0) -> int:
 
 
 def _normalize_fingerprint(value: str) -> str:
-    """Accept hex, colon-separated hex, or base64 and reduce to lowercase hex."""
+    """Reduce a LocalSend fingerprint to comparable lowercase hex.
+
+    LocalSend advertises uppercase hex with no separators; hex/colon/base64 are
+    accepted here so a hand-written value still works.
+    """
     import base64
     import binascii
     import re
@@ -544,15 +579,7 @@ def _normalize_fingerprint(value: str) -> str:
     return ""
 
 
-def peer_certificate_fingerprint(peer: Peer, timeout: float = 5.0) -> str:
-    """SHA-256 (hex) of the peer's TLS certificate."""
-    ctx = _ssl_context()
-    with socket.create_connection((peer.ip, peer.port), timeout=timeout) as raw_sock:
-        with ctx.wrap_socket(raw_sock, server_hostname=peer.ip) as tls_sock:
-            der = tls_sock.getpeercert(binary_form=True)
-    if not der:
-        return ""
-    return hashlib.sha256(der).hexdigest()
+
 
 
 def verify_peer_certificate(peer: Peer, timeout: float = 5.0) -> str:
@@ -567,7 +594,8 @@ def verify_peer_certificate(peer: Peer, timeout: float = 5.0) -> str:
         return ""
     advertised = _normalize_fingerprint(peer.fingerprint)
     try:
-        actual = peer_certificate_fingerprint(peer, timeout=timeout)
+        # LocalSend advertises uppercase hex; compare both sides in one case.
+        actual = _normalize_fingerprint(peer_certificate_fingerprint(peer, timeout=timeout))
     except OSError as exc:
         raise LocalSendError(f"cannot verify certificate of {peer.base_url}: {exc}") from exc
     if not actual:
@@ -577,7 +605,7 @@ def verify_peer_certificate(peer: Peer, timeout: float = 5.0) -> str:
     if advertised != actual:
         raise LocalSendError(
             f"certificate fingerprint mismatch for {peer.ip}:{peer.port} "
-            f"(advertised {advertised[:16]}…, presented {actual[:16]}…)"
+            f"(advertised {peer.fingerprint[:16]}…, presented {actual[:16]}…)"
         )
     return ""
 

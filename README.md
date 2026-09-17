@@ -199,6 +199,27 @@ before any bytes move. A mismatch aborts the transfer.
 Implements [LocalSend Protocol v2.2](https://github.com/localsend/protocol) — what LocalSend 1.18.x
 ships; v3 is still a draft in that repository.
 
+<a id="encrypted-peers"></a>
+
+### Encrypted peers (LocalSend's default mode)
+
+LocalSend's default is HTTPS with **mandatory client certificates**, and the certificate *is* the
+identity — the JSON `fingerprint` is only checked against it. Talking to a peer like that needs three
+things, all of which this plugin now does:
+
+1. **A device certificate.** On first use the plugin creates a persistent RSA-2048 self-signed
+   certificate (`CN=LocalSend User`, the same shape LocalSend generates) under
+   `~/.hermes/localsend-identity/`, key mode `0600`. It is never regenerated, because peers remember
+   devices by its fingerprint.
+2. **The matching fingerprint.** The fingerprint is the SHA-256 of the DER certificate in **uppercase
+   hex** (LocalSend's `fingerprint_from_cert_der` format). That — not the HTTP-mode random value — is
+   what gets announced when sending to an encrypted peer, since a mismatch is silently ignored.
+3. **Certificate pinning on the peer.** The peer's certificate is hashed and compared against the
+   fingerprint it advertised before any bytes move; a mismatch aborts the transfer.
+
+`localsend_send` picks this up automatically for any peer whose discovery record says `https`. For a
+peer addressed directly by address, state it: `{"peer": "192.168.68.83", "scheme": "https", "files": [...]}`.
+
 ### Configuration
 
 Optional, under `plugins.entries.localsend.settings` in `~/.hermes/config.yaml`:
@@ -213,6 +234,7 @@ Optional, under `plugins.entries.localsend.settings` in `~/.hermes/config.yaml`:
 | `discovery_timeout_s` | `3` | Multicast listen window |
 | `send_timeout_s` | `120` | Per-file upload timeout |
 | `scan_subnets` | `true` | Also sweep the local `/24` over HTTP |
+| `identity_dir` | `~/.hermes/localsend-identity` | Where the certificate for HTTPS peers lives |
 
 ## Troubleshooting
 
@@ -299,13 +321,10 @@ node tools/desktop-contract-check.mjs desktop/plugin.js
 
 ## Limits
 
-- **HTTP mode only.** LocalSend's default is HTTPS with mutual TLS, where the certificate *is* the
-  identity (`fingerprint` is ignored in HTTPS mode, per the protocol). Verified against iOS LocalSend:
-  a TLS handshake succeeds when a client certificate is presented, but the peer rejects one it has not
-  paired with (`SSLV3_ALERT_CERTIFICATE_UNKNOWN`), and plain HTTP to that listener times out by design.
-  Interoperating with encrypted peers needs a persistent self-signed certificate, an HTTPS receiver
-  that requests client certificates, and cert-pinned outbound connections. Until then, set the peer's
-  encryption **off** to use this plugin.
+- **Encrypted peers are send-only for now.** Sending *to* a peer in LocalSend's default HTTPS mode
+  works (see [Encrypted peers](#encrypted-peers)); receiving from one still needs the receiver to serve
+  HTTPS with its own certificate request, which is not implemented. Announce HTTP to keep the receive
+  direction working, or turn the sender's encryption off.
 - **No download/reverse-transfer API** (protocol §5) — the upload path is what phones use by default.
 - **Protocol v2.2.** v3 is a draft upstream; current clients ship v2.2.
 - **No mDNS/Bonjour, no relay, no NAT traversal.** Same L2 network, or a subnet you can route to.

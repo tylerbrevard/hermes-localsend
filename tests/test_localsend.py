@@ -238,6 +238,169 @@ def spec_send(
     return statuses
 
 
+# ---------------------------------------------------------------------------
+# HTTPS / mTLS oracle — mirrors LocalSend's server, which (per its Rust source,
+# packages/core/src/http/server/common/client_cert_verifier.rs) accepts any
+# time-valid self-signed client certificate, then matches the announced
+# fingerprint against that certificate at the application layer.
+# ---------------------------------------------------------------------------
+class TlsSpecReceiver:
+    """A LocalSend-shaped receiver behind TLS that records client certificates."""
+
+    def __init__(
+        self,
+        port: int,
+        certs_dir: str,
+        require_client_cert: bool = True,
+        alias: str = "TLS Oracle",
+        trust_client_cert: str = "",
+    ):
+        from hermes_localsend import certs as certs_module
+
+        self.certs = certs_module
+        self.port = port
+        self.require_client_cert = require_client_cert
+        # LocalSend's client verifier trusts a specific certificate; when a test
+        # supplies the sender's certificate, the oracle requires it at the TLS
+        # layer (mandatory client auth), otherwise it only requests one.
+        self.trust_client_cert = trust_client_cert
+        self.identity = certs_module.generate(certs_dir)
+        self.info = {
+            "alias": alias,
+            "version": "2.2",
+            "deviceModel": "Oracle",
+            "deviceType": "desktop",
+            "fingerprint": self.identity.fingerprint,
+            "port": port,
+            "protocol": "https",
+            "download": False,
+        }
+        self.client_certs: list[bytes] = []
+        self.announced: list[str] = []
+        self.received: dict[str, bytes] = {}
+        self.statuses: list[int] = []
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        import io
+        import ssl as ssl_module
+
+        oracle = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):  # noqa: D102
+                pass
+
+            def _send(self, status, payload=None):
+                raw = json.dumps(payload or {}).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def _client_der(self):
+                try:
+                    return self.connection.getpeercert(binary_form=True)
+                except (AttributeError, ValueError, OSError):
+                    return None
+
+            def _read(self, length):
+                buf = b""
+                while len(buf) < length:
+                    piece = self.rfile.read(length - len(buf))
+                    if not piece:
+                        break
+                    buf += piece
+                return buf
+
+            def do_POST(self):  # noqa: N802
+                parsed = urlparse(self.path)
+                der = self._client_der()
+                if der:
+                    oracle.client_certs.append(der)
+
+                if parsed.path == f"{API}/register":
+                    self._read(int(self.headers.get("Content-Length") or 0))
+                    self._send(200, oracle.info)
+                    return
+
+                if parsed.path == f"{API}/prepare-upload":
+                    body = json.loads(self._read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                    announced = str((body.get("info") or {}).get("fingerprint") or "")
+                    oracle.announced.append(announced)
+                    # LocalSend's app-layer rule: the JSON fingerprint must equal the
+                    # SHA-256 (uppercase hex) of the client certificate presented.
+                    if not der:
+                        oracle.statuses.append(403)
+                        self._send(403, {})
+                        return
+                    matches = announced.upper() == oracle.certs.fingerprint_from_der(der)
+                    if oracle.require_client_cert and not matches:
+                        oracle.statuses.append(403)
+                        self._send(403, {})
+                        return
+                    files = body.get("files") or {}
+                    session = uuid.uuid4().hex[:16]
+                    oracle._session = session
+                    oracle._tokens = {fid: uuid.uuid4().hex for fid in files}
+                    oracle._files = files
+                    oracle.statuses.append(200)
+                    self._send(200, {"sessionId": session, "files": oracle._tokens})
+                    return
+
+                if parsed.path == f"{API}/upload":
+                    query = parse_qs(parsed.query)
+                    fid = (query.get("fileId") or [""])[0]
+                    body = self._read(int(self.headers.get("Content-Length") or 0))
+                    oracle.received[fid] = body
+                    oracle.statuses.append(200)
+                    self._send(200, {})
+                    return
+
+                self._send(404, {})
+
+            def do_GET(self):  # noqa: N802
+                if urlparse(self.path).path == f"{API}/info":
+                    self._send(200, oracle.info)
+                    return
+                self._send(404, {})
+
+        ctx = ssl_module.SSLContext(ssl_module.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(oracle.identity.cert_path, oracle.identity.key_path)
+        if oracle.trust_client_cert:
+            # Anchor the sender's certificate, then demand it: this reproduces the
+            # mandatory client auth of LocalSend's v2 server (its verifier is handed
+            # the certificate it expects rather than a public CA).
+            ctx.load_verify_locations(oracle.trust_client_cert)
+            ctx.verify_mode = ssl_module.CERT_REQUIRED
+        else:
+            ctx.verify_mode = ssl_module.CERT_OPTIONAL
+
+        class QuietServer(ThreadingHTTPServer):
+            def handle_error(self, request, client_address):  # a refused handshake is expected here
+                pass
+
+        server = QuietServer(("127.0.0.1", oracle.port), Handler)
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        oracle._server = server
+        oracle._thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
+        oracle._thread.start()
+
+    def stop(self) -> None:
+        if self._server:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def payloads(self) -> list[bytes]:
+        return list(self.received.values())
+
+
 class TempFileMixin(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="localsend-test-")
@@ -541,6 +704,120 @@ def spec_send_with_info(port: int, path: str, info: dict) -> dict:
     resp.read()
     conn.close()
     return {"prepare": status}
+
+
+# ---------------------------------------------------------------------------
+# HTTPS / mTLS sender tests
+# ---------------------------------------------------------------------------
+class HttpsSenderTests(TempFileMixin):
+    """Sending to a peer in LocalSend's default (encrypted) mode."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from hermes_localsend import certs as certs_module
+
+        self.certs = certs_module
+        self.identity_dir = os.path.join(self.tmp, "identity")
+        self.peer_certs_dir = os.path.join(self.tmp, "peer-certs")
+        protocol._identity = None          # keep tests independent
+
+    def identity(self):
+        identity = self.certs.generate(self.identity_dir)
+        protocol.set_identity(identity)
+        return identity
+
+    def test_identity_uses_localsend_fingerprint_format(self) -> None:
+        identity = self.identity()
+        self.assertRegex(identity.fingerprint, r"^[0-9A-F]{64}$")
+        # stable across reloads — peers remember devices by this value
+        again = self.certs.generate(self.identity_dir)
+        self.assertEqual(again.fingerprint, identity.fingerprint)
+
+    def test_identity_key_is_not_world_readable(self) -> None:
+        identity = self.identity()
+        mode = os.stat(identity.key_path).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_send_presents_a_client_certificate_matching_the_announced_fingerprint(self) -> None:
+        identity = self.identity()
+        port = self.free_port()
+        oracle = TlsSpecReceiver(port, self.peer_certs_dir, trust_client_cert=identity.cert_path)
+        oracle.start()
+        self.addCleanup(oracle.stop)
+
+        source = self.make_file("over-tls.bin", 128 * 1024)
+        peer = Peer(alias="TLS Oracle", ip="127.0.0.1", port=port, protocol="https", fingerprint=oracle.info["fingerprint"])
+        result = protocol.send_files(peer, [source], DeviceInfo(alias="Sender", fingerprint=identity.fingerprint, protocol="https"))
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(oracle.statuses, [200, 200])
+        self.assertTrue(oracle.client_certs, "sender presented no client certificate")
+        # what we announced must be this certificate's fingerprint, in LocalSend's format
+        self.assertEqual(oracle.announced, [identity.fingerprint])
+        self.assertEqual(
+            oracle.announced[0].upper(), self.certs.fingerprint_from_der(oracle.client_certs[0])
+        )
+        self.assertEqual(list(oracle.received.values()), [open(source, "rb").read()])
+
+    def test_without_an_identity_the_peer_refuses_the_transfer(self) -> None:
+        """No client certificate means no identity to match — client auth is mandatory."""
+        identity = self.identity()
+        port = self.free_port()
+        oracle = TlsSpecReceiver(port, self.peer_certs_dir, trust_client_cert=identity.cert_path)
+        oracle.start()
+        self.addCleanup(oracle.stop)
+
+        source = self.make_file("no-identity.bin", 1024)
+        peer = Peer(alias="TLS Oracle", ip="127.0.0.1", port=port, protocol="https")
+        protocol._identity = None
+        with self.assertRaises(LocalSendError):
+            protocol.send_files(peer, [source], DeviceInfo(alias="Sender"))
+        self.assertEqual(oracle.client_certs, [], "presented a certificate without an identity")
+
+    def test_pinning_rejects_a_peer_whose_certificate_is_not_the_announced_identity(self) -> None:
+        port = self.free_port()
+        oracle = TlsSpecReceiver(port, self.peer_certs_dir)
+        oracle.start()
+        self.addCleanup(oracle.stop)
+
+        wrong = "0" * 64
+        peer = Peer(alias="Impostor", ip="127.0.0.1", port=port, protocol="https", fingerprint=wrong)
+        with self.assertRaises(LocalSendError) as ctx:
+            protocol.verify_peer_certificate(peer)
+        self.assertIn("fingerprint mismatch", str(ctx.exception))
+        self.assertEqual(oracle.client_certs, [], "abort must happen before any request")
+
+    def test_pinning_accepts_the_announced_identity(self) -> None:
+        port = self.free_port()
+        oracle = TlsSpecReceiver(port, self.peer_certs_dir)
+        oracle.start()
+        self.addCleanup(oracle.stop)
+        peer = Peer(alias="TLS Oracle", ip="127.0.0.1", port=port, protocol="https", fingerprint=oracle.info["fingerprint"].lower())
+        self.assertEqual(protocol.verify_peer_certificate(peer), "")
+
+    def test_tool_sends_to_an_https_peer_end_to_end(self) -> None:
+        instance = plugin_tools.LocalSendTools(
+            FakeCtx(), {"port": self.free_port(), "scan_subnets": False, "identity_dir": self.identity_dir}
+        )
+        identity = instance.identity()
+        port = self.free_port()
+        oracle = TlsSpecReceiver(port, self.peer_certs_dir, trust_client_cert=identity.cert_path)
+        oracle.start()
+        self.addCleanup(oracle.stop)
+        source = self.make_file("tool-tls.bin", 4096)
+        result = json.loads(instance.send({"peer": f"127.0.0.1:{port}", "files": [source]}))
+        # The peer is addressed directly (no discovery), so the tool assumes HTTP;
+        # pointing it at an HTTPS peer must fail loudly rather than silently.
+        self.assertFalse(result["success"])
+
+        https_result = json.loads(
+            instance.send(
+                {"peer": f"127.0.0.1:{port}", "files": [source], "scheme": "https"}
+            )
+        )
+        self.assertTrue(https_result["success"], https_result)
+        self.assertEqual(https_result["identity_fingerprint"], identity.fingerprint)
+        self.assertEqual(oracle.announced, [identity.fingerprint])
 
 
 # ---------------------------------------------------------------------------

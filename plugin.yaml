@@ -1,5 +1,5 @@
 name: localsend
-version: 1.15.0
+version: 1.16.0
 description: "LocalSend peer-to-peer file transfer — discover devices on the LAN, send files or text to phones and desktops, and run a headless receiver so they can send files here. Stdlib-only implementation of LocalSend Protocol v2.2."
 author: "Tyler Lyon"
 license: MIT
@@ -18,3 +18,4 @@ config_schema:
   discovery_timeout_s: {type: float, default: 3, description: "Seconds to listen for multicast discovery replies."}
   send_timeout_s: {type: float, default: 120, description: "Per-file upload timeout in seconds."}
   scan_subnets: {type: bool, default: true, description: "Also probe the local /24 over HTTP when multicast is unavailable."}
+  identity_dir: {type: str, default: "", description: "Where the device certificate for HTTPS peers lives (default ~/.hermes/localsend-identity)."}
