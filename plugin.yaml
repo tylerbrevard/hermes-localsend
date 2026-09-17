@@ -1,7 +1,5 @@
 name: localsend
-version: 1.12.0
-manifest_version: 2
-api_version: 1
+version: 1.12.1
 description: "LocalSend peer-to-peer file transfer — discover devices on the LAN, send files or text to phones and desktops, and run a headless receiver so they can send files here. Stdlib-only implementation of LocalSend Protocol v2.2."
 author: "Tyler Lyon"
 license: MIT
