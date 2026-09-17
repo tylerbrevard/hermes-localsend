@@ -190,12 +190,16 @@ Optional, under `plugins.entries.localsend.settings` in `~/.hermes/config.yaml`:
 
 ## Troubleshooting
 
-**The phone is running LocalSend, but discovery finds nothing.**
-The usual cause is not the network — it's iOS/Android suspending the app. A backgrounded LocalSend
-still holds its listening socket, so `nc -z <phone> 53317` **succeeds** while every request times
-out: TCP connects, nothing answers, and not even the TLS handshake starts. Bring LocalSend to the
-foreground, keep the screen on, and re-discover. Remember the shape of it: *port open + request
-timeout = suspended app*, not a protocol bug.
+**The phone is running LocalSend, but discovery finds nothing, and plain HTTP requests time out.**
+`nc -z <phone> 53317` succeeding while an HTTP request times out does **not** tell you the app is
+asleep. LocalSend's default mode is **HTTPS with mutual TLS**, and a TLS-only listener never answers
+plaintext — the TCP connection is accepted and then simply sits there. Confirm which mode the peer is
+in before concluding anything: if a TLS handshake reaches the peer, it is awake. You may see
+`tlsv13 alert certificate required`, which means the listener wants *your* client certificate.
+
+**This plugin speaks HTTP mode.** If a peer is in encrypted (HTTPS/mTLS) mode it cannot be driven by
+these tools, and it cannot push to this receiver. Turn encryption off on that peer, or track the
+mTLS work below.
 
 **The device is found, but `prepare-upload` returns 403.**
 Someone has to accept the transfer on the receiving device. On a phone that means tapping the
@@ -211,9 +215,12 @@ receiver running. Quit it, or configure a different `port`. The receiver reports
 instead of failing silently.
 
 **Multicast is fine, but macOS still sees nothing.**
-macOS gates multicast behind Local Network permission. If the Hermes host has never been granted it,
-the announce leaves and no replies arrive. Allow the host in *System Settings → Privacy & Security →
-Local Network*.
+macOS gates local-network traffic behind Local Network permission — and it is granted **per process**,
+so where the receiver runs matters. Measured on macOS 26: from a `launchd` agent, multicast sends
+*and* a plain TCP connect to another LAN host both fail with `EHOSTUNREACH` (Errno 65) while a local
+listen still succeeds; the same calls from the Hermes process tree work. Run the receiver inside
+Hermes (the gateway keeps it alive), not as its own launchd job — and if it must be a service, grant
+it Local Network access in *System Settings → Privacy & Security → Local Network*.
 
 **`409 blocked by another session`.**
 The receiver is mid-transfer with another device. Retry when it finishes.
@@ -258,9 +265,13 @@ answers the way a real peer does, and the reply has to come back parsed as a pee
 
 ## Limits
 
-- **No HTTPS receiving.** The receiver speaks HTTP, so senders need LocalSend's encryption toggle
-  **off** (iOS and Android both expose it). Generating a self-signed certificate is the change that
-  would lift this.
+- **HTTP mode only.** LocalSend's default is HTTPS with mutual TLS, where the certificate *is* the
+  identity (`fingerprint` is ignored in HTTPS mode, per the protocol). Verified against iOS LocalSend:
+  a TLS handshake succeeds when a client certificate is presented, but the peer rejects one it has not
+  paired with (`SSLV3_ALERT_CERTIFICATE_UNKNOWN`), and plain HTTP to that listener times out by design.
+  Interoperating with encrypted peers needs a persistent self-signed certificate, an HTTPS receiver
+  that requests client certificates, and cert-pinned outbound connections. Until then, set the peer's
+  encryption **off** to use this plugin.
 - **No download/reverse-transfer API** (protocol §5) — the upload path is what phones use by default.
 - **Protocol v2.2.** v3 is a draft upstream; current clients ship v2.2.
 - **No mDNS/Bonjour, no relay, no NAT traversal.** Same L2 network, or a subnet you can route to.
