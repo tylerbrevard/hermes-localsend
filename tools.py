@@ -379,8 +379,10 @@ class LocalSendTools:
                 _receiver = None
             if not server:
                 return self._ok({"stopped": False, "message": "receiver was not running"})
-            snapshot = self._public_status(server)
             server.stop()
+            # Snapshot AFTER stopping: taken before, it reported running=True next to
+            # stopped=True and readers (the pane's chip, an agent) got a contradiction.
+            snapshot = self._public_status(server)
             return self._ok({"stopped": True, **snapshot})
 
         if action == "status":

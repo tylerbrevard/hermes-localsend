@@ -16,6 +16,7 @@ import http.client
 import importlib.util
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -1068,5 +1069,82 @@ class HelperTests(TempFileMixin):
         self.assertEqual(protocol.verify_peer_certificate(Peer(alias="a", ip="127.0.0.1", port=1)), "")
 
 
+class StopReportingTest(unittest.TestCase):
+    """The stop response must describe a receiver that is actually stopped."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="ls-stop-")
+        self.instance = plugin_tools.LocalSendTools(
+            FakeCtx(),
+            {
+                "port": 0,
+                "alias": "Stop Test",
+                "scan_subnets": False,
+                "inbox_dir": os.path.join(self.tmp, "inbox"),
+            },
+        )
+
+    def test_stop_reports_a_stopped_receiver(self) -> None:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+
+        started = json.loads(self.instance.receive({"action": "start", "port": port, "alias": "Stop Test"}))
+        self.assertTrue(started["running"], started)
+
+        stopped = json.loads(self.instance.receive({"action": "stop"}))
+        self.assertTrue(stopped["stopped"], stopped)
+        self.assertFalse(stopped["running"], f"stop reported the receiver still running: {stopped}")
+        self.assertEqual(stopped["uptime_s"], 0, stopped)
+
+        after = json.loads(self.instance.receive({"action": "status"}))
+        self.assertFalse(after["running"], after)
+
+        with socket.socket() as probe:
+            probe.settimeout(1.0)
+            self.assertNotEqual(probe.connect_ex(("127.0.0.1", port)), 0, "port still bound after stop")
+
+    def test_stopping_twice_is_not_an_error(self) -> None:
+        first = json.loads(self.instance.receive({"action": "stop"}))
+        self.assertFalse(first["stopped"], first)
+        self.assertIn("not running", first["message"])
+
+
+class PaneBackendContractTest(unittest.TestCase):
+    """Every ctx.rest path the desktop pane calls must exist on the backend.
+
+    The pane is loaded from a file and the backend is mounted by the app, so a
+    renamed route fails silently in the UI. This pins the two together.
+    """
+
+    def setUp(self) -> None:
+        try:
+            import fastapi  # noqa: F401
+        except ImportError:  # pragma: no cover - the repo venv has fastapi, system python may not
+            self.skipTest("fastapi is not installed in this interpreter")
+
+    def test_pane_calls_match_backend_routes(self) -> None:
+        import importlib.util
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        java_script = open(os.path.join(root, "desktop", "plugin.js"), encoding="utf-8").read()
+        calls = set()
+        for match in re.finditer(r"""ctx\.rest\(\s*['"]([^'"?]+)(\?[^'"]*)?['"]""", java_script):
+            calls.add(match.group(1))
+        self.assertTrue(calls, "no ctx.rest calls found — the pane would render nothing")
+
+        spec = importlib.util.spec_from_file_location(
+            "localsend_api_contract", os.path.join(root, "dashboard", "plugin_api.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["localsend_api_contract"] = module
+        spec.loader.exec_module(module)
+        routes = {route.path for route in module.router.routes if getattr(route, "path", None)}
+
+        missing = sorted(call for call in calls if call not in routes)
+        self.assertEqual(missing, [], f"pane calls routes the backend does not serve: {missing} (serves {sorted(routes)})")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
