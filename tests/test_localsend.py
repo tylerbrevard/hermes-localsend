@@ -408,11 +408,12 @@ class ReceiverTests(TempFileMixin):
         conn.close()
         self.assertEqual(len(server.peers), 1)
 
-    def test_self_announce_is_refused(self) -> None:
+    def test_same_device_sender_is_accepted(self) -> None:
+        """Fingerprint guards self-discovery only — a device must be able to send to its own receiver."""
         server = self.start_receiver()
         source = self.make_file("self.bin", 128)
         statuses = spec_send_with_info(server.port, source, server.info.to_dict())
-        self.assertEqual(statuses["prepare"], 403)
+        self.assertEqual(statuses["prepare"], 200)
 
     def test_cancel_clears_the_session(self) -> None:
         server = self.start_receiver()

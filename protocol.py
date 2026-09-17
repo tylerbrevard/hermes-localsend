@@ -697,11 +697,11 @@ class ReceiveServer:
                 info = payload.get("info") or {}
                 peer = _peer_from_payload(info, ip, source="uploader")
                 if peer:
+                    # NOTE: the fingerprint only guards self-*discovery* (section 2) —
+                    # it must not gate an upload, or a device could never send to its
+                    # own receiver (a local Hermes-to-Hermes transfer is legitimate).
                     with server._lock:
                         server.peers[peer.fingerprint or peer.ip] = peer
-                        if peer.fingerprint == server.info.fingerprint:
-                            self._json(403, {})  # never accept our own announce
-                            return
                 if not isinstance(files, dict) or not files:
                     self._json(400, {})
                     return

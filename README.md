@@ -110,7 +110,8 @@ Implements [LocalSend Protocol v2.2](https://github.com/localsend/protocol)
   `POST /api/localsend/v2/upload?sessionId=…&fileId=…&token=…` with a raw binary body.
 * **Verification** — senders advertise `sha256`; receivers verify it and answer `422` on
   mismatch. The receiver also enforces Content-Length, per-file tokens and the session's source
-  IP, and refuses a `prepare-upload` whose advertised fingerprint is its own.
+  IP. The device fingerprint is used only to ignore our own discovery announces — it never gates
+  an upload, so a machine can send to its own receiver.
 * **Encryption** — the receiver serves plain HTTP, so no self-signed certificate is needed and
   browsers/CLIs can talk to it. Sending to an HTTPS peer works too: the peer's certificate is
   hashed and compared against the fingerprint it advertised before any file is transferred.
