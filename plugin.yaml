@@ -1,0 +1,22 @@
+name: localsend
+version: 1.12.0
+manifest_version: 2
+api_version: 1
+description: "LocalSend peer-to-peer file transfer — discover devices on the LAN, send files or text to phones and desktops, and run a headless receiver so they can send files here. Stdlib-only implementation of LocalSend Protocol v2.2."
+author: "Tyler Lyon"
+license: MIT
+homepage: https://github.com/tylerbrevard/hermes-localsend
+tags: [files, lan, localsend, airdrop, transfer]
+provides_tools:
+  - localsend_discover
+  - localsend_send
+  - localsend_receive
+config_schema:
+  alias: {type: str, default: "", description: "Device name peers see (default: 'Hermes (<hostname>).')"}
+  port: {type: int, default: 53317, description: "LocalSend port (default 53317)."}
+  download_dir: {type: str, default: "", description: "Inbox for received files (default ~/Downloads/LocalSend)."}
+  outbox_dir: {type: str, default: "", description: "Where text sent as a file is written (default ~/.hermes/localsend-outbox)."}
+  pin: {type: str, default: "", description: "PIN to require from senders / send to receivers."}
+  discovery_timeout_s: {type: float, default: 3, description: "Seconds to listen for multicast discovery replies."}
+  send_timeout_s: {type: float, default: 120, description: "Per-file upload timeout in seconds."}
+  scan_subnets: {type: bool, default: true, description: "Also probe the local /24 over HTTP when multicast is unavailable."}
