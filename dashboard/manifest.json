@@ -1,0 +1,8 @@
+{
+  "name": "localsend",
+  "label": "LocalSend",
+  "description": "LocalSend peer-to-peer file transfer — receiver state, nearby devices, and the inbox",
+  "icon": "Radio",
+  "version": "1.15.0",
+  "api": "plugin_api.py"
+}

@@ -67,6 +67,32 @@ Nothing else to configure — no dependencies, no keys, no service. Verify it la
 hermes plugins doctor localsend     # → registrations: 3 tool(s), 0 hook(s)
 ```
 
+### In Hermes Desktop
+
+One install ships three surfaces. The package carries a `desktop/` half and a `dashboard/`
+backend, so the app copies the UI into `~/.hermes/desktop-plugins/localsend/` and derives a
+**LOCALSEND** pane, a status-bar chip, and three ⌘K commands. Both switches default to off:
+
+| Surface | Where | Turn it on |
+| --- | --- | --- |
+| Agent tools | every Hermes session | `plugins.enabled` in `config.yaml` (`hermes plugins enable localsend`) |
+| Desktop pane / chip / commands | Hermes Desktop | **Capabilities → Plugins → LocalSend** |
+| Backend routes (`/api/plugins/localsend/…`) | dashboard + desktop pane | the same `plugins.enabled` allow-list (Python is gated separately from the UI toggle) |
+
+The pane shows whether the receiver is up, this machine's LAN address, the devices currently
+visible, and the inbox — newest first, with **reveal** to open it in Finder. Buttons start/stop the
+receiver and rescan the network. ⌘K: *LocalSend: start receiver*, *stop receiver*, *scan for
+devices*. The status chip shows a live dot plus how many files have arrived.
+
+```text
+/api/plugins/localsend/status    receiver + inbox + addresses
+/api/plugins/localsend/start     POST — start the receiver
+/api/plugins/localsend/stop      POST — stop it
+/api/plugins/localsend/devices   GET  — discover peers
+/api/plugins/localsend/send      POST — push files to a peer
+/api/plugins/localsend/inbox     GET  — inbox listing straight off disk
+```
+
 ## Use
 
 ```text
@@ -259,6 +285,14 @@ from the protocol spec:
 Plus a **live multicast round-trip**: our announce is read off the group by a listener, the listener
 answers the way a real peer does, and the reply has to come back parsed as a peer.
 
+The desktop half gets its own offline contract check — it stubs `@hermes/plugin-sdk`, `react` and
+`react/jsx-runtime`, imports the plugin, calls `register()`, then runs every `render()` in three
+states (receiving, stopped, backend unreachable) and every palette command:
+
+```bash
+node tools/desktop-contract-check.mjs desktop/plugin.js
+```
+
 `git log` is the changelog; each release notes what changed and what was verified.
 
 <a id="limits"></a>
@@ -275,6 +309,10 @@ answers the way a real peer does, and the reply has to come back parsed as a pee
 - **No download/reverse-transfer API** (protocol §5) — the upload path is what phones use by default.
 - **Protocol v2.2.** v3 is a draft upstream; current clients ship v2.2.
 - **No mDNS/Bonjour, no relay, no NAT traversal.** Same L2 network, or a subnet you can route to.
+- **The receiver lives in one process.** Whichever process starts it owns it — the gateway for the
+  agent tools, the dashboard/desktop backend for the pane. They share a single receiver when both run
+  in one process; across two processes the second start reports the bind error instead of stealing
+  the port.
 
 ## License
 
