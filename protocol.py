@@ -635,16 +635,71 @@ class ReceiveServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def handle_expect_100(self) -> bool:
+                self.send_response_only(100)
+                self.end_headers()
+                return True
+
             def _empty(self, status: int) -> None:
                 self.send_response(status)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
+            def _iter_body(self):
+                """Yield the request body, handling Content-Length *and* chunked encoding.
+
+                Mobile clients (iOS LocalSend among them) send bodies with
+                ``Transfer-Encoding: chunked`` and no Content-Length. Reading only
+                Content-Length silently yields a zero-byte body, which looks like a
+                checksum failure rather than a framing bug.
+                """
+                encoding = (self.headers.get("Transfer-Encoding") or "").lower()
+                if "chunked" in encoding:
+                    while True:
+                        line = self.rfile.readline(1024).strip()
+                        if b";" in line:
+                            line = line.split(b";", 1)[0].strip()
+                        if not line:
+                            raise ValueError("empty chunk size line")
+                        size = int(line, 16)
+                        if size == 0:
+                            while True:  # consume optional trailers
+                                trailer = self.rfile.readline(1024)
+                                if trailer in (b"\r\n", b"\n", b""):
+                                    break
+                            return
+                        remaining = size
+                        while remaining:
+                            piece = self.rfile.read(min(CHUNK, remaining))
+                            if not piece:
+                                raise ValueError("truncated chunk")
+                            remaining -= len(piece)
+                            yield piece
+                        self.rfile.read(2)  # trailing CRLF
+                    return
+                remaining = int(self.headers.get("Content-Length") or 0)
+                while remaining > 0:
+                    piece = self.rfile.read(min(CHUNK, remaining))
+                    if not piece:
+                        break
+                    remaining -= len(piece)
+                    yield piece
+
+            def _read_body(self, limit: int = 2 * 1024 * 1024) -> bytes:
+                buf = bytearray()
+                for piece in self._iter_body():
+                    buf.extend(piece)
+                    if len(buf) > limit:
+                        raise ValueError("body too large")
+                return bytes(buf)
+
             def _body(self) -> dict[str, Any]:
-                length = int(self.headers.get("Content-Length") or 0)
-                if not length:
+                try:
+                    raw = self._read_body()
+                except ValueError:
                     return {}
-                raw = self.rfile.read(length)
+                if not raw:
+                    return {}
                 try:
                     parsed = json.loads(raw.decode("utf-8", "replace"))
                     return parsed if isinstance(parsed, dict) else {}
@@ -736,22 +791,35 @@ class ReceiveServer:
                     self._json(403, {})
                     return
                 meta = session["files"].get(file_id) or {}
-                length = int(self.headers.get("Content-Length") or 0)
-                if length != int(meta.get("size") or 0):
-                    self._json(400, {})
-                    return
+                expected_size = int(meta.get("size") or 0)
+                chunked = "chunked" in (self.headers.get("Transfer-Encoding") or "").lower()
+                if not chunked:
+                    # Content-Length is authoritative when present; reject early on a mismatch.
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length != expected_size:
+                        self._json(400, {})
+                        return
                 safe_name = os.path.basename(str(meta.get("fileName") or file_id))
                 target = _unique_path(os.path.join(server.download_dir, safe_name))
                 digest = hashlib.sha256()
                 read = 0
-                with open(target, "wb") as fh:
-                    while read < length:
-                        chunk = self.rfile.read(min(CHUNK, length - read))
-                        if not chunk:
-                            break
-                        read += len(chunk)
-                        digest.update(chunk)
-                        fh.write(chunk)
+                try:
+                    with open(target, "wb") as fh:
+                        for piece in self._iter_body():
+                            read += len(piece)
+                            digest.update(piece)
+                            fh.write(piece)
+                except ValueError as exc:
+                    if os.path.exists(target):
+                        os.unlink(target)
+                    server.errors.append(f"bad body framing for {safe_name}: {exc}")
+                    self._json(400, {})
+                    return
+                if expected_size and read != expected_size:
+                    os.unlink(target)
+                    server.errors.append(f"size mismatch for {safe_name}: got {read}, expected {expected_size}")
+                    self._json(400, {})
+                    return
                 expected = meta.get("sha256")
                 if expected and digest.hexdigest().lower() != str(expected).lower():
                     os.unlink(target)

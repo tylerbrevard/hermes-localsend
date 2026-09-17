@@ -394,6 +394,55 @@ class ReceiverTests(TempFileMixin):
         names = sorted(os.listdir(inbox))
         self.assertEqual(names, ["dup (1).bin", "dup.bin"])
 
+    def test_chunked_prepare_and_upload_lands_the_file(self) -> None:
+        """Regression: bodies sent with Transfer-Encoding: chunked must not read as empty."""
+        server = self.start_receiver()
+        source = self.make_file("chunked.bin", 40 * 1024)
+        statuses = spec_send_chunked(server.port, source, chunk_size=4096)
+        self.assertEqual(statuses, {"prepare": 200, "upload": 200})
+        self.assertEqual(len(server.received), 1)
+        record = server.received[0]
+        self.assertEqual(open(record["path"], "rb").read(), open(source, "rb").read())
+        self.assertEqual(record["sha256"], hashlib.sha256(open(source, "rb").read()).hexdigest())
+        self.assertEqual(server.errors, [])
+
+    def test_chunked_many_small_chunks_streams_correctly(self) -> None:
+        server = self.start_receiver()
+        source = self.make_file("many.bin", 256 * 1024)
+        statuses = spec_send_chunked(server.port, source, chunk_size=997)   # deliberately odd chunk size
+        self.assertEqual(statuses["upload"], 200)
+        self.assertEqual(open(server.received[0]["path"], "rb").read(), open(source, "rb").read())
+
+    def test_chunked_size_mismatch_is_400(self) -> None:
+        server = self.start_receiver()
+        source = self.make_file("short.bin", 4096)
+        statuses = spec_send_chunked(server.port, source, override_size=999999)
+        self.assertEqual(statuses["upload"], 400)
+        self.assertEqual(server.received, [])
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "inbox")), [])
+
+    def test_chunked_truncated_body_is_rejected(self) -> None:
+        server = self.start_receiver()
+        source = self.make_file("trunc.bin", 8192)
+        data = open(source, "rb").read()
+        file_id = "abc"
+        meta = {"id": file_id, "fileName": "trunc.bin", "size": len(data), "fileType": "application/octet-stream"}
+        prepare = json.dumps({"info": DeviceInfo(port=server.port).to_dict(), "files": {file_id: meta}}).encode()
+        status, payload = chunked_post(server.port, f"{API}/prepare-upload", prepare)
+        self.assertEqual(status, 200)
+        session_id = json.loads(payload)["sessionId"]
+        token = json.loads(payload)["files"][file_id]
+        status, _ = chunked_post(
+            server.port, f"{API}/upload?sessionId={session_id}&fileId={file_id}&token={token}", data, truncate_last=True
+        )
+        self.assertIn(status, (-1, 400))
+        self.assertEqual(server.received, [])
+
+    def test_chunked_prepare_with_non_json_body_is_400(self) -> None:
+        server = self.start_receiver()
+        status, _ = chunked_post(server.port, f"{API}/prepare-upload", b"this is not json")
+        self.assertEqual(status, 400)
+
     def test_register_and_info_routes(self) -> None:
         server = self.start_receiver()
         conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
@@ -430,6 +479,54 @@ class ReceiverTests(TempFileMixin):
         self.assertEqual(conn.getresponse().status, 200)
         conn.close()
         self.assertEqual(server.status()["active_sessions"], 0)
+
+
+def chunked_post(port: int, path: str, body: bytes, chunk_size: int = 4096, truncate_last: bool = False) -> tuple[int, bytes]:
+    """POST a body with Transfer-Encoding: chunked (how mobile LocalSend clients send)."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+    conn.putrequest("POST", path)
+    conn.putheader("Content-Type", "application/json")
+    conn.putheader("Transfer-Encoding", "chunked")
+    conn.endheaders()
+    pieces = [body[i:i + chunk_size] for i in range(0, len(body), chunk_size)] or [b""]
+    for piece in pieces:
+        conn.send(f"{len(piece):X}\r\n".encode() + piece + b"\r\n")
+    if truncate_last:
+        conn.send(b"5\r\nshort")          # lies about the length, then hangs up
+        conn.close()
+        return -1, b""
+    conn.send(b"0\r\n\r\n")
+    resp = conn.getresponse()
+    status, payload = resp.status, resp.read()
+    conn.close()
+    return status, payload
+
+
+def spec_send_chunked(port: int, path: str, chunk_size: int = 4096, override_size: int | None = None) -> dict:
+    """Full prepare-upload + upload over chunked encoding."""
+    data = open(path, "rb").read()
+    file_id = uuid.uuid4().hex[:12]
+    meta = {
+        "id": file_id,
+        "fileName": os.path.basename(path),
+        "size": len(data) if override_size is None else override_size,
+        "fileType": "application/octet-stream",
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    info = DeviceInfo(alias="Chunked Sender", deviceType="mobile", port=port, protocol="http").to_dict()
+    statuses: dict[str, int] = {}
+    prepare_body = json.dumps({"info": info, "files": {file_id: meta}}).encode()
+    status, payload = chunked_post(port, f"{API}/prepare-upload", prepare_body, chunk_size=64)
+    statuses["prepare"] = status
+    if status != 200:
+        return statuses
+    parsed = json.loads(payload)
+    session_id = parsed["sessionId"]
+    token = parsed["files"][file_id]
+    statuses["upload"], _ = chunked_post(
+        port, f"{API}/upload?sessionId={session_id}&fileId={file_id}&token={token}", data, chunk_size=chunk_size
+    )
+    return statuses
 
 
 def spec_send_with_info(port: int, path: str, info: dict) -> dict:
