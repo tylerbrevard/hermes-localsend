@@ -7,7 +7,7 @@ No account, no cloud, and nothing to install on the other device — it just tal
 
 [![Release](https://img.shields.io/github/v/release/tylerbrevard/hermes-localsend?style=flat-square&color=22d3ee&label=release)](https://github.com/tylerbrevard/hermes-localsend/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-33%20passing-brightgreen?style=flat-square)](tests/)
+[![Tests](https://img.shields.io/badge/tests-48%20passing-brightgreen?style=flat-square)](tests/)
 [![Protocol](https://img.shields.io/badge/LocalSend%20protocol-2.2-22d3ee?style=flat-square)](https://github.com/localsend/protocol)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-success?style=flat-square)](#why-standard-library-only)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square)](#limits)
@@ -79,7 +79,11 @@ backend, so the app copies the UI into `~/.hermes/desktop-plugins/localsend/` an
 | Desktop pane / chip / commands | Hermes Desktop | **Capabilities → Plugins → LocalSend** |
 | Backend routes (`/api/plugins/localsend/…`) | dashboard + desktop pane | the same `plugins.enabled` allow-list (Python is gated separately from the UI toggle) |
 
-The pane shows whether the receiver is up, this machine's LAN address, the devices currently
+#### The pane
+
+![The LocalSend pane in Hermes Desktop](docs/screenshots/pane.png)
+
+Status, this machine's LAN address, the devices currently
 visible, and the inbox — newest first, with **reveal** to open it in Finder. Buttons start/stop the
 receiver and rescan the network. ⌘K: *LocalSend: start receiver*, *stop receiver*, *scan for
 devices*. The status chip shows a live dot plus how many files have arrived.
@@ -144,6 +148,16 @@ and timestamp. A second `photo.jpg` lands as `photo (1).jpg` — **an incoming f
 existing one**.
 
 ## What it looks like
+
+### In the app
+
+![Hermes Desktop with the LocalSend pane open, status-bar chip on the right](docs/screenshots/desktop.png)
+
+The **LOCALSEND** pane sits beside your chats; the chip in the status bar (`localsend · 1`) shows the
+receiver's state and how many files have arrived. Both are wired to the same receiver the agent tools
+drive, so a file your phone sends appears in the pane without a refresh.
+
+### Tool output
 
 Real output from the installed plugin, not a mock-up:
 
@@ -319,12 +333,29 @@ node tools/desktop-contract-check.mjs desktop/plugin.js
 
 <a id="limits"></a>
 
+## Verified
+
+Every claim on this page was produced by running the thing, not by reading it. What backs what:
+
+| Claim | Evidence |
+| --- | --- |
+| Protocol correctness | 48 tests (`python3 -m unittest discover -s tests`) — discovery, the register handshake, prepare-upload negotiation, chunked request bodies, sha256-verified uploads, receiver state transitions |
+| It moves real files | iPhone → this Mac, 311,005 bytes, `sha256 f809130f…229b7` matching on disk byte for byte |
+| It sends to LocalSend's **default** mode | 200,000 bytes over mutual TLS from the installed package; the announced fingerprint equals the SHA-256 of the certificate actually presented |
+| HTTPS peers behave like LocalSend's | a TLS oracle that mirrors the upstream verifier — mandatory client auth, fingerprint matched at the application layer, pinning |
+| The desktop pane really drives it | **Start** clicked in the running app → `python … TCP *:53317 (LISTEN)` |
+| The pane and the backend can't drift | a test parses `ctx.rest('/…')` out of `desktop/plugin.js` and asserts every path exists on the backend router |
+| Honest state reporting | `action="stop"` returns `stopped: true` **and** `running: false`, with the port released |
+
 ## Limits
 
 - **Encrypted peers are send-only for now.** Sending *to* a peer in LocalSend's default HTTPS mode
   works (see [Encrypted peers](#encrypted-peers)); receiving from one still needs the receiver to serve
   HTTPS with its own certificate request, which is not implemented. Announce HTTP to keep the receive
   direction working, or turn the sender's encryption off.
+- **Certificate generation uses `openssl`** for the HTTPS identity. It ships with macOS and virtually
+  every Linux distribution; without it, sending to an encrypted peer reports a clear error instead of
+  falling back to something weaker.
 - **No download/reverse-transfer API** (protocol §5) — the upload path is what phones use by default.
 - **Protocol v2.2.** v3 is a draft upstream; current clients ship v2.2.
 - **No mDNS/Bonjour, no relay, no NAT traversal.** Same L2 network, or a subnet you can route to.

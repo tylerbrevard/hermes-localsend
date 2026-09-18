@@ -100,6 +100,11 @@ function LocalSendPane(props) {
   const data = status.data || {}
   const running = Boolean(data.running)
   const unreachable = Boolean(status.error) || data.ok === false
+  // "listening" is the honest idle state: the receiver is open but no transfer is
+  // in flight. "receiving" is reserved for an active session. Computed after
+  // `unreachable` — referencing it earlier is a temporal-dead-zone crash.
+  const active = Number(data.active_sessions || 0) > 0
+  const state = unreachable ? 'backend off' : !running ? 'stopped' : active ? 'receiving' : 'listening'
   const received = data.received || []
   const peers = (devices.data && devices.data.peers) || []
   const warnings = [...(data.errors || [])]
@@ -140,10 +145,7 @@ function LocalSendPane(props) {
             className: 'flex items-center gap-1.5',
             children: [
               jsx(StatusDot, { tone: unreachable ? 'neutral' : running ? 'ok' : 'neutral' }),
-              jsx('span', {
-                className: 'text-(--ui-text-quaternary)',
-                children: unreachable ? 'backend off' : running ? 'receiving' : 'stopped',
-              }),
+              jsx('span', { className: 'text-(--ui-text-quaternary)', children: state }),
             ],
           }),
         ],
@@ -289,7 +291,9 @@ function StatusChip(props) {
   return jsxs('button', {
     type: 'button',
     className: 'flex items-center gap-1.5 text-[0.6875rem] text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)',
-    title: running ? `LocalSend receiving on port ${data.port}` : 'LocalSend receiver stopped',
+    title: running
+      ? `LocalSend ${Number(data.active_sessions || 0) > 0 ? 'receiving a file' : 'listening'} on port ${data.port}`
+      : 'LocalSend receiver stopped',
     onClick: () => host.navigate('/settings/plugins'),
     children: [
       jsx(StatusDot, { tone: running ? 'ok' : 'neutral' }),
