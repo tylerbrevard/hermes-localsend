@@ -136,7 +136,7 @@ the tool returns `403 rejected` rather than hanging.
 ### `localsend_receive`
 
 ```json
-{"action": "start", "alias": "Hermes", "download_dir": "~/Downloads/LocalSend", "pin": ""}
+{"action": "start", "alias": "Hermes", "download_dir": "~/Downloads/LocalSend", "pin": "482913"}
 {"action": "start", "https": true}          # serve TLS for peers that force encryption
 {"action": "status"}
 {"action": "stop"}
@@ -283,6 +283,9 @@ Optional, under `plugins.entries.localsend.settings` in `~/.hermes/config.yaml`:
 | `scan_subnets` | `true` | Also sweep the local `/24` over HTTP |
 | `identity_dir` | `~/.hermes/localsend-identity` | Where the certificate for HTTPS peers lives |
 | `receive_https` | `false` | Serve the receiver over TLS for peers that force encryption |
+| `share_roots` | `[]` | Extra directories files may be sent from or received into (see [Security defaults](#security-defaults)) |
+| `allow_public_peers` | `false` | Allow sending to a bare IP outside private/link-local/loopback ranges |
+| `max_transfer_bytes` | `2147483648` (2 GiB) | Largest upload the receiver accepts, per file and per session |
 
 ## Troubleshooting
 
@@ -328,9 +331,30 @@ one-shot `hermes -z` process exits and takes the receiver with it.
 
 ## Security
 
+### Security defaults
+
+These hold without any configuration; each has a config key to widen it deliberately.
+
+- **Send only from share roots.** `localsend_send` refuses any `files` entry that does not resolve
+  (symlinks followed) into `~/.hermes/media`, `~/.hermes/output`, the configured `download_dir`, or a
+  directory listed in `share_roots`. A symlink inside a root that points outside it is refused too.
+  `text` notes are written into `outbox_dir` by the plugin itself and are always sendable.
+- **Send only to LAN peers.** A `peer` that discovery did not report must be a private (RFC 1918),
+  link-local or loopback address. Set `allow_public_peers: true` to send to anything else.
+- **The receiver always has a PIN.** `action: "start"` with no `pin` generates a random 6-digit PIN
+  and returns it as `pin` (with `pin_generated: true`) in the tool result — read it there and give it
+  to the sender. `prepare-upload` without it is `401`.
+- **Uploads are capped.** Any announced file size, or the session total, above `max_transfer_bytes`
+  (default 2 GiB) is refused at `prepare-upload` with `413`; a body that runs past the cap is cut
+  off, deleted, and answered `413`.
+- **The inbox stays inside a share root.** A per-call `download_dir` must resolve into one of the
+  roots above; otherwise the receiver does not start.
+
+### Notes
+
 - While the receiver runs it binds `0.0.0.0` on the LocalSend port — inherent to being discoverable on
   a LAN. It is **not** running by default: nothing listens until `localsend_receive` is called with
-  `action: "start"`. Set a `pin`, or `action: "stop"`, on untrusted networks.
+  `action: "start"`, and it always requires a PIN. Use `action: "stop"` when it is not needed.
 - Incoming uploads are validated before they touch disk: session token, source IP, `Content-Length`,
   and the sender's `sha256`. A mismatch returns `422` and deletes the partial file.
 - Filenames are reduced to their basename, so a sender cannot write outside the inbox.

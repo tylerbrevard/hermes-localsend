@@ -6,9 +6,11 @@ returning a JSON string, never raising.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
+import secrets
 import tempfile
 import threading
 import time
@@ -22,6 +24,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_ALIAS_PREFIX = "Hermes"
 DEFAULT_INBOX = os.path.join("~", "Downloads", "LocalSend")
 DEFAULT_IDENTITY_DIR = os.path.join("~", ".hermes", "localsend-identity")
+# Directories files may be sent from (and received into) unless the config
+# adds more via ``share_roots``. Anything outside is refused, symlinks included.
+DEFAULT_SHARE_ROOTS = (os.path.join("~", ".hermes", "media"), os.path.join("~", ".hermes", "output"))
+DEFAULT_MAX_TRANSFER_BYTES = 2 * 1024 ** 3
+# Address ranges a directly addressed peer may live in unless ``allow_public_peers`` is set.
+_LOCAL_NETWORKS = tuple(
+    ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.0/8")
+)
 
 # Receiver is a process-wide singleton: one port, one inbox per Hermes process.
 _receiver: Optional[ReceiveServer] = None
@@ -82,6 +92,38 @@ class LocalSendTools:
     def identity_dir(self) -> str:
         configured = str(self.settings.get("identity_dir") or "").strip()
         return os.path.expanduser(configured or DEFAULT_IDENTITY_DIR)
+
+    @property
+    def share_roots(self) -> list[str]:
+        """Real paths of the directories the tools may read from / write into."""
+        configured = self.settings.get("share_roots") or []
+        if isinstance(configured, str):
+            configured = [configured]
+        roots = list(DEFAULT_SHARE_ROOTS) + [str(r) for r in configured if str(r).strip()]
+        roots.append(self.inbox_default)  # the configured inbox is operator-chosen, so it is a root too
+        seen: list[str] = []
+        for root in roots:
+            real = os.path.realpath(os.path.expanduser(root))
+            if real not in seen:
+                seen.append(real)
+        return seen
+
+    def _within_share_roots(self, path: str) -> bool:
+        """True when ``path`` (with every symlink resolved) lives under a share root."""
+        real = os.path.realpath(os.path.expanduser(path))
+        return any(real == root or real.startswith(root + os.sep) for root in self.share_roots)
+
+    @property
+    def max_transfer_bytes(self) -> int:
+        try:
+            value = int(self.settings.get("max_transfer_bytes") or DEFAULT_MAX_TRANSFER_BYTES)
+        except (TypeError, ValueError):
+            value = DEFAULT_MAX_TRANSFER_BYTES
+        return max(1, value)
+
+    @property
+    def allow_public_peers(self) -> bool:
+        return bool(self.settings.get("allow_public_peers", False))
 
     def identity(self) -> certs.Identity:
         """Device certificate for HTTPS peers (created on first use)."""
@@ -206,6 +248,8 @@ class LocalSendTools:
         pin = args.get("pin")
         pin = self.pin_default if pin is None else str(pin).strip()
 
+        named = list(paths)  # the text note below is ours; only caller-named paths are confined
+
         if text is not None and str(text) != "":
             outbox = os.path.expanduser(str(self.settings.get("outbox_dir") or "~/.hermes/localsend-outbox"))
             os.makedirs(outbox, exist_ok=True)
@@ -221,6 +265,14 @@ class LocalSendTools:
         missing = [p for p in paths if not os.path.isfile(p)]
         if missing:
             return self._err(f"not a file: {', '.join(missing)}")
+        # realpath also catches a symlink inside a share root that points outside it.
+        outside = [p for p in named if not self._within_share_roots(p)]
+        if outside:
+            return self._err(
+                f"refusing to send files outside the share roots: {', '.join(outside)}",
+                share_roots=self.share_roots,
+                hint="Copy the file into a share root or add its directory to 'share_roots' in the plugin config.",
+            )
 
         discovered: list[dict[str, Any]] = []
         if not target or bool(args.get("discover")):
@@ -324,6 +376,11 @@ class LocalSendTools:
         # Direct address form: ip or ip:port (no discovery needed)
         host, _, port_text = needle.partition(":")
         if host.count(".") == 3 and all(part.isdigit() for part in host.split(".")):
+            if not self.allow_public_peers and not _is_local_address(host):
+                raise LocalSendError(
+                    f"refusing to send to {host}: not a discovered device and not a private, link-local or "
+                    "loopback address (set allow_public_peers: true in the plugin config to override)"
+                )
             port = int(port_text) if port_text.isdigit() else self.port_default
             # A directly addressed peer has no advertisement to read the transport
             # from, so it must be stated; HTTP stays the default.
@@ -354,8 +411,19 @@ class LocalSendTools:
                 except (TypeError, ValueError):
                     port = self.port_default
                 download_dir = os.path.expanduser(str(args.get("download_dir") or self.inbox_default))
+                if not self._within_share_roots(download_dir):
+                    return self._err(
+                        f"download_dir must be inside a share root: {download_dir}",
+                        share_roots=self.share_roots,
+                    )
                 pin = args.get("pin")
                 pin = self.pin_default if pin is None else str(pin).strip()
+                pin_generated = False
+                if not pin:
+                    # Never listen unauthenticated by accident: a PIN the sender must
+                    # know is the only sender-side check the protocol offers.
+                    pin = f"{secrets.randbelow(10 ** 6):06d}"
+                    pin_generated = True
 
                 # Serving TLS identifies us by certificate, so the announced fingerprint
                 # must be the certificate's — that is what a peer pins us by.
@@ -375,7 +443,12 @@ class LocalSendTools:
                     fingerprint=identity.fingerprint if identity else "",
                 )
                 server = ReceiveServer(
-                    info=info, download_dir=download_dir, pin=pin, https=use_https, identity=identity
+                    info=info,
+                    download_dir=download_dir,
+                    pin=pin,
+                    https=use_https,
+                    identity=identity,
+                    max_transfer_bytes=self.max_transfer_bytes,
                 )
                 try:
                     detail = server.start()
@@ -387,6 +460,8 @@ class LocalSendTools:
                 {
                     "message": f"LocalSend receiver up ({detail}); peers will see '{alias}'",
                     **self._public_status(server),
+                    "pin": pin,
+                    "pin_generated": pin_generated,
                     "next": "Run localsend_receive with action='status' after the sender accepts, to collect the files.",
                 }
             )
@@ -423,6 +498,15 @@ class LocalSendTools:
         status["inbox"] = status.pop("download_dir")
         status["received_count"] = len(status.get("received", []))
         return status
+
+
+def _is_local_address(host: str) -> bool:
+    """RFC1918, link-local or loopback — the only places an undiscovered peer may be."""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(address in network for network in _LOCAL_NETWORKS)
 
 
 def temp_dir() -> str:  # pragma: no cover - convenience for manual testing

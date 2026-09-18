@@ -541,6 +541,18 @@ class ReceiverTests(TempFileMixin):
         source = self.make_file("size.bin", 1024)
         self.assertEqual(spec_send(server.port, source, override_size=999999)["upload"], 400)
 
+    def test_max_transfer_bytes_is_enforced(self) -> None:
+        server = self.start_receiver(max_transfer_bytes=4096)
+        big = self.make_file("big.bin", 8192)
+        self.assertEqual(spec_send(server.port, big)["prepare"], 413, "announced size over the cap is refused at prepare")
+        small = self.make_file("small.bin", 1024)
+        self.assertEqual(spec_send(server.port, small)["upload"], 200)
+        # a body that runs past the announced (under-cap) size is cut off by the cap, not stored
+        statuses = spec_send_chunked(server.port, big, override_size=1000)
+        self.assertEqual(statuses["upload"], 413)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.tmp, "inbox"))), ["small.bin"])
+        self.assertEqual(server.status()["max_transfer_bytes"], 4096)
+
     def test_pin_gate(self) -> None:
         server = self.start_receiver(pin="1234")
         source = self.make_file("pin.bin", 512)
@@ -798,7 +810,8 @@ class HttpsSenderTests(TempFileMixin):
 
     def test_tool_sends_to_an_https_peer_end_to_end(self) -> None:
         instance = plugin_tools.LocalSendTools(
-            FakeCtx(), {"port": self.free_port(), "scan_subnets": False, "identity_dir": self.identity_dir}
+            FakeCtx(),
+            {"port": self.free_port(), "scan_subnets": False, "identity_dir": self.identity_dir, "share_roots": [self.tmp]},
         )
         identity = instance.identity()
         port = self.free_port()
@@ -961,12 +974,17 @@ class ToolTests(TempFileMixin):
         plugin_tools._receiver = None
         self.addCleanup(lambda: setattr(plugin_tools, "_receiver", None))
 
+    def tools(self, **settings) -> plugin_tools.LocalSendTools:
+        base = {"port": self.free_port(), "scan_subnets": False, "share_roots": [self.tmp]}
+        base.update(settings)
+        return plugin_tools.LocalSendTools(FakeCtx(), base)
+
     def test_send_by_direct_address(self) -> None:
         port = self.free_port()
         oracle = SpecReceiver(port, alias="Oracle")
         oracle.start()
         self.addCleanup(oracle.stop)
-        instance = plugin_tools.LocalSendTools(FakeCtx(), {"port": self.free_port(), "scan_subnets": False})
+        instance = self.tools()
         source = self.make_file("tool.bin", 2048)
         result = json.loads(instance.send({"peer": f"127.0.0.1:{port}", "files": [source]}))
         self.assertTrue(result["success"], result)
@@ -989,7 +1007,7 @@ class ToolTests(TempFileMixin):
         self.assertTrue(meta["fileType"].startswith("text/"))
 
     def test_send_without_target_or_peers_returns_guidance(self) -> None:
-        instance = plugin_tools.LocalSendTools(FakeCtx(), {"port": self.free_port(), "scan_subnets": False, "discovery_timeout_s": 0.5})
+        instance = self.tools(discovery_timeout_s=0.5)
         source = self.make_file("orphan.bin", 64)
         result = json.loads(instance.send({"files": [source]}))
         self.assertFalse(result["success"])
@@ -1004,14 +1022,19 @@ class ToolTests(TempFileMixin):
 
     def test_receive_lifecycle_reports_what_it_stored(self) -> None:
         inbox = os.path.join(self.tmp, "inbox")
-        instance = plugin_tools.LocalSendTools(FakeCtx(), {"port": self.free_port(), "download_dir": inbox, "scan_subnets": False})
+        instance = self.tools(download_dir=inbox)
         started = json.loads(instance.receive({"action": "start", "alias": "Hermes Test", "port": instance.port_default}))
         self.assertTrue(started["success"], started)
         self.assertTrue(started["running"])
         self.assertEqual(started["inbox"], inbox)
+        # No PIN configured, so one was generated and handed back for the sender.
+        self.assertTrue(started["pin_generated"], started)
+        self.assertRegex(started["pin"], r"^\d{6}$")
+        self.assertTrue(started["pin_required"])
 
         source = self.make_file("pushed.bin", 8192)
-        statuses = spec_send(instance.port_default, source)
+        self.assertEqual(spec_send(instance.port_default, source)["prepare"], 401, "no PIN must be refused")
+        statuses = spec_send(instance.port_default, source, pin=started["pin"])
         self.assertEqual(statuses["upload"], 200)
 
         reported = json.loads(instance.receive({"action": "status"}))
@@ -1021,6 +1044,55 @@ class ToolTests(TempFileMixin):
         stopped = json.loads(instance.receive({"action": "stop"}))
         self.assertTrue(stopped["stopped"])
         self.assertFalse(json.loads(instance.receive({"action": "status"}))["running"])
+
+    def test_send_refuses_files_outside_share_roots(self) -> None:
+        port = self.free_port()
+        oracle = SpecReceiver(port, alias="Oracle")
+        oracle.start()
+        self.addCleanup(oracle.stop)
+        root = os.path.join(self.tmp, "root")
+        os.makedirs(root)
+        instance = plugin_tools.LocalSendTools(FakeCtx(), {"port": self.free_port(), "scan_subnets": False, "share_roots": [root]})
+
+        outside = self.make_file("secret.bin", 64)
+        result = json.loads(instance.send({"peer": f"127.0.0.1:{port}", "files": [outside]}))
+        self.assertFalse(result["success"], result)
+        self.assertIn("share roots", result["error"])
+
+        # a symlink inside a root that points outside must not get through either
+        link = os.path.join(root, "innocent.bin")
+        os.symlink(outside, link)
+        result = json.loads(instance.send({"peer": f"127.0.0.1:{port}", "files": [link]}))
+        self.assertFalse(result["success"], result)
+        self.assertIn("share roots", result["error"])
+        self.assertEqual(oracle.prepare_calls, [], "nothing may reach the wire")
+
+        inside = os.path.join(root, "ok.bin")
+        with open(inside, "wb") as fh:
+            fh.write(b"x" * 32)
+        result = json.loads(instance.send({"peer": f"127.0.0.1:{port}", "files": [inside]}))
+        self.assertTrue(result["success"], result)
+
+    def test_send_refuses_public_peer_unless_allowed(self) -> None:
+        instance = self.tools()
+        source = self.make_file("out.bin", 16)
+        result = json.loads(instance.send({"peer": "203.0.113.7", "files": [source]}))
+        self.assertFalse(result["success"], result)
+        self.assertIn("allow_public_peers", result["error"])
+        for local in ("10.1.2.3", "172.16.0.9", "192.168.1.20", "169.254.1.1"):
+            self.assertTrue(plugin_tools._is_local_address(local), local)
+        self.assertFalse(plugin_tools._is_local_address("8.8.8.8"))
+        # the override exists for deliberate off-LAN use; the send then fails only on reachability
+        permissive = self.tools(allow_public_peers=True, send_timeout_s=1)
+        peer = permissive._resolve_peer("203.0.113.7:1", [])
+        self.assertEqual(peer.ip, "203.0.113.7")
+
+    def test_receive_confines_download_dir_to_share_roots(self) -> None:
+        instance = self.tools()
+        result = json.loads(instance.receive({"action": "start", "download_dir": tempfile.mkdtemp(prefix="elsewhere-")}))
+        self.assertFalse(result["success"], result)
+        self.assertIn("share root", result["error"])
+        self.assertIsNone(plugin_tools._receiver)
 
     def test_receive_unknown_action(self) -> None:
         instance = plugin_tools.LocalSendTools(FakeCtx(), {"scan_subnets": False})

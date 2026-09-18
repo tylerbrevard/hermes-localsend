@@ -640,6 +640,10 @@ def verify_peer_certificate(peer: Peer, timeout: float = 5.0) -> str:
 # --------------------------------------------------------------------------
 
 
+class _TooLarge(Exception):
+    """An upload body ran past ``max_transfer_bytes``."""
+
+
 class ReceiveServer:
     """A LocalSend-compatible receiver (headless).
 
@@ -654,10 +658,12 @@ class ReceiveServer:
         pin: str = "",
         https: bool = False,
         identity=None,
+        max_transfer_bytes: int = 0,
     ) -> None:
         self.info = info
         self.download_dir = os.path.abspath(download_dir)
         self.pin = pin
+        self.max_transfer_bytes = int(max_transfer_bytes or 0)  # 0 = unlimited
         self.https = bool(https)
         self.identity = identity
         self.sessions: dict[str, dict[str, Any]] = {}
@@ -817,6 +823,10 @@ class ReceiveServer:
                 if not isinstance(files, dict) or not files:
                     self._json(400, {})
                     return
+                if server.max_transfer_bytes and not server._sizes_allowed(files):
+                    server.errors.append(f"refused session from {ip}: exceeds max_transfer_bytes={server.max_transfer_bytes}")
+                    self._json(413, {})
+                    return
                 session_id = uuid.uuid4().hex[:16]
                 tokens: dict[str, str] = {}
                 session_files: dict[str, dict[str, Any]] = {}
@@ -849,10 +859,14 @@ class ReceiveServer:
                     return
                 meta = session["files"].get(file_id) or {}
                 expected_size = int(meta.get("size") or 0)
+                cap = server.max_transfer_bytes
                 chunked = "chunked" in (self.headers.get("Transfer-Encoding") or "").lower()
                 if not chunked:
                     # Content-Length is authoritative when present; reject early on a mismatch.
                     length = int(self.headers.get("Content-Length") or 0)
+                    if cap and length > cap:
+                        self._json(413, {})
+                        return
                     if length != expected_size:
                         self._json(400, {})
                         return
@@ -864,8 +878,15 @@ class ReceiveServer:
                     with open(target, "wb") as fh:
                         for piece in self._iter_body():
                             read += len(piece)
+                            if cap and read > cap:
+                                raise _TooLarge(f"{read} > {cap}")
                             digest.update(piece)
                             fh.write(piece)
+                except _TooLarge as exc:
+                    os.unlink(target)
+                    server.errors.append(f"upload of {safe_name} exceeded max_transfer_bytes: {exc}")
+                    self._json(413, {})
+                    return
                 except ValueError as exc:
                     if os.path.exists(target):
                         os.unlink(target)
@@ -958,6 +979,19 @@ class ReceiveServer:
         if self._announce_thread:
             self._announce_thread.join(timeout=2)
 
+    def _sizes_allowed(self, files: dict[str, Any]) -> bool:
+        """Every announced size, and their sum, must fit under the transfer cap."""
+        total = 0
+        for meta in files.values():
+            try:
+                size = int((meta or {}).get("size") or 0)
+            except (TypeError, ValueError, AttributeError):
+                return False
+            if size < 0 or size > self.max_transfer_bytes:
+                return False
+            total += size
+        return total <= self.max_transfer_bytes
+
     def status(self) -> dict[str, Any]:
         alive = bool(self._thread and self._thread.is_alive())
         with self._lock:
@@ -970,6 +1004,7 @@ class ReceiveServer:
                 "identity_fingerprint": getattr(self.identity, "fingerprint", "") if self.https else "",
                 "download_dir": self.download_dir,
                 "pin_required": bool(self.pin),
+                "max_transfer_bytes": self.max_transfer_bytes,
                 "started_at": self.started_at,
                 "uptime_s": round(time.time() - self.started_at, 1) if self.started_at and alive else 0,
                 "received": list(self.received),
