@@ -229,6 +229,7 @@ async def start(body: Optional[dict[str, Any]] = None) -> dict[str, Any]:
                         "alias": body.get("alias"),
                         "port": body.get("port"),
                         "pin": body.get("pin"),
+                        "https": body.get("https"),
                     }
                 )
             )

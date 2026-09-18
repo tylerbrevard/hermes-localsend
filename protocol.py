@@ -173,6 +173,31 @@ def _ssl_context(insecure: bool = True, identity=None) -> ssl.SSLContext:
     return ctx
 
 
+def _server_ssl_context(identity) -> ssl.SSLContext:
+    """TLS for the receiver: present our certificate, pin-able by fingerprint.
+
+    LocalSend's own server makes client auth *mandatory* and validates the peer
+    certificate itself (``client_cert_verifier.rs``). Python's stdlib cannot do
+    that: requesting a client certificate makes OpenSSL validate the chain against
+    its trust store, so a peer's self-signed certificate fails the handshake with
+    ``unknown ca`` and there is no permissive verify callback exposed. The receiver
+    therefore serves server-authenticated TLS: the peer pins *our* certificate
+    (its SHA-256 is what we announce), and sender identity is whatever the
+    application layer can establish. Documented in the README rather than implied.
+    """
+    if identity is None:
+        raise LocalSendError(
+            "an HTTPS receiver needs a device certificate; run any send to an encrypted peer "
+            "first (or set identity_dir) so ~/.hermes/localsend-identity exists"
+        )
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(identity.cert_path, identity.key_path)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    # No client-certificate request: see above — stdlib cannot accept self-signed ones.
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def _connection(peer: Peer, timeout: float) -> http.client.HTTPConnection:
     if peer.protocol == "https":
         return http.client.HTTPSConnection(peer.ip, peer.port, timeout=timeout, context=_ssl_context())
@@ -627,10 +652,14 @@ class ReceiveServer:
         info: DeviceInfo,
         download_dir: str,
         pin: str = "",
+        https: bool = False,
+        identity=None,
     ) -> None:
         self.info = info
         self.download_dir = os.path.abspath(download_dir)
         self.pin = pin
+        self.https = bool(https)
+        self.identity = identity
         self.sessions: dict[str, dict[str, Any]] = {}
         self.received: list[dict[str, Any]] = []
         self.rejected: list[dict[str, Any]] = []
@@ -869,18 +898,34 @@ class ReceiveServer:
                 logger.info("localsend: received %s (%d bytes) from %s", safe_name, read, ip)
                 self._empty(200)
 
+        if self.https:
+            # Announce https *before* binding: the transport is part of our identity
+            # in discovery, and peers decide plain-vs-TLS from it.
+            self.info.protocol = "https"
         try:
             self._server = ThreadingHTTPServer(("", self.port), Handler)
         except OSError as exc:
             raise LocalSendError(
                 f"cannot bind TCP port {self.port}: {exc}. Is another LocalSend instance running?"
             ) from exc
+        if self.https:
+            try:
+                self._server.socket = _server_ssl_context(self.identity).wrap_socket(
+                    self._server.socket, server_side=True
+                )
+            except LocalSendError:
+                # Close *and* forget it: a server whose serve_forever never ran cannot
+                # be shut down, and stop() on it would block forever.
+                self._server.server_close()
+                self._server = None
+                raise
         self._thread = threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True)
         self._thread.start()
         self.started_at = time.time()
         self._announce_thread = threading.Thread(target=self._announce_loop, daemon=True)
         self._announce_thread.start()
-        return f"listening on {self.port}"
+        transport = "https (server certificate, fingerprint-pinnable)" if self.https else "http"
+        return f"listening on {self.port} over {transport}"
 
     def _announce_loop(self) -> None:
         """Announce presence periodically so peers keep us in their device list."""
@@ -903,7 +948,10 @@ class ReceiveServer:
     def stop(self) -> None:
         self._stop.set()
         if self._server:
-            self._server.shutdown()
+            # shutdown() only returns once serve_forever has exited; calling it on a
+            # server that never started blocks the caller indefinitely.
+            if self._thread and self._thread.is_alive():
+                self._server.shutdown()
             self._server.server_close()
         if self._thread:
             self._thread.join(timeout=3)
@@ -918,6 +966,8 @@ class ReceiveServer:
                 "alias": self.info.alias,
                 "port": self.port,
                 "protocol": self.info.protocol,
+                "https": self.https,
+                "identity_fingerprint": getattr(self.identity, "fingerprint", "") if self.https else "",
                 "download_dir": self.download_dir,
                 "pin_required": bool(self.pin),
                 "started_at": self.started_at,

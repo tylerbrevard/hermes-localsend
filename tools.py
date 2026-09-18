@@ -357,8 +357,26 @@ class LocalSendTools:
                 pin = args.get("pin")
                 pin = self.pin_default if pin is None else str(pin).strip()
 
-                info = self.device_info(alias=alias, port=port)
-                server = ReceiveServer(info=info, download_dir=download_dir, pin=pin)
+                # Serving TLS identifies us by certificate, so the announced fingerprint
+                # must be the certificate's — that is what a peer pins us by.
+                requested = args.get("https")
+                use_https = bool(self.settings.get("receive_https", False) if requested is None else requested)
+                identity = None
+                if use_https:
+                    try:
+                        identity = self.identity()
+                    except certs.IdentityError as exc:
+                        return self._err(f"cannot prepare the device certificate: {exc}")
+
+                info = self.device_info(
+                    alias=alias,
+                    port=port,
+                    protocol_name="https" if use_https else "http",
+                    fingerprint=identity.fingerprint if identity else "",
+                )
+                server = ReceiveServer(
+                    info=info, download_dir=download_dir, pin=pin, https=use_https, identity=identity
+                )
                 try:
                     detail = server.start()
                 except LocalSendError as exc:

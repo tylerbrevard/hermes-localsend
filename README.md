@@ -7,7 +7,7 @@ No account, no cloud, and nothing to install on the other device — it just tal
 
 [![Release](https://img.shields.io/github/v/release/tylerbrevard/hermes-localsend?style=flat-square&color=22d3ee&label=release)](https://github.com/tylerbrevard/hermes-localsend/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-48%20passing-brightgreen?style=flat-square)](tests/)
+[![Tests](https://img.shields.io/badge/tests-53-brightgreen?style=flat-square)](tests/)
 [![Protocol](https://img.shields.io/badge/LocalSend%20protocol-2.2-22d3ee?style=flat-square)](https://github.com/localsend/protocol)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-success?style=flat-square)](#why-standard-library-only)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square)](#limits)
@@ -137,6 +137,7 @@ the tool returns `403 rejected` rather than hanging.
 
 ```json
 {"action": "start", "alias": "Hermes", "download_dir": "~/Downloads/LocalSend", "pin": ""}
+{"action": "start", "https": true}          # serve TLS for peers that force encryption
 {"action": "status"}
 {"action": "stop"}
 ```
@@ -234,6 +235,38 @@ things, all of which this plugin now does:
 `localsend_send` picks this up automatically for any peer whose discovery record says `https`. For a
 peer addressed directly by address, state it: `{"peer": "192.168.68.83", "scheme": "https", "files": [...]}`.
 
+<a id="serving-tls"></a>
+
+### Serving TLS (receivers)
+
+Peers configured to **always encrypt** will only talk to an https peer, so the receiver can serve TLS too:
+
+```json
+{"action": "start", "https": true}
+```
+
+The certificate is the same device identity used for sending, and the fingerprint announced in discovery
+is that certificate's — which is what a peer pins when it connects. Equivalent config: `receive_https: true`.
+
+**What this does and does not verify.** The receiver presents a certificate and the peer pins it; the
+receiver does **not** validate the sender's certificate. That is a deliberate, measured limitation, not
+an oversight: LocalSend's own server makes client authentication mandatory and validates the peer
+certificate itself, but Python's stdlib cannot do the same — requesting a client certificate makes
+OpenSSL validate the chain against its trust store, so a peer's self-signed certificate fails the
+handshake outright with `unknown ca` (`CERT_OPTIONAL` and `CERT_REQUIRED` both behave this way, and no
+permissive verify callback is exposed). Verified directly:
+
+```
+CERT_OPTIONAL + self-signed client cert -> SSLError: TLSV1_ALERT_UNKNOWN_CA
+CERT_REQUIRED + self-signed client cert -> SSLError: TLSV1_ALERT_UNKNOWN_CA
+CERT_NONE     + self-signed client cert -> ok, but the certificate is never requested or read
+```
+
+So a TLS receiver is **server-authenticated, encrypted, and fingerprint-pinnable**, but it accepts any
+sender that can reach the port. If sender identity matters, set a `pin` — that is checked on every
+upload. Plain HTTP remains the default because it is what phones use against an http peer, and it is
+what the verified iPhone transfer above used.
+
 ### Configuration
 
 Optional, under `plugins.entries.localsend.settings` in `~/.hermes/config.yaml`:
@@ -249,6 +282,7 @@ Optional, under `plugins.entries.localsend.settings` in `~/.hermes/config.yaml`:
 | `send_timeout_s` | `120` | Per-file upload timeout |
 | `scan_subnets` | `true` | Also sweep the local `/24` over HTTP |
 | `identity_dir` | `~/.hermes/localsend-identity` | Where the certificate for HTTPS peers lives |
+| `receive_https` | `false` | Serve the receiver over TLS for peers that force encryption |
 
 ## Troubleshooting
 
@@ -305,7 +339,7 @@ one-shot `hermes -z` process exits and takes the receiver with it.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v     # 33 tests, no dependencies, loopback only
+python3 -m unittest discover -s tests -v     # 53 tests, no dependencies, loopback only
 hermes plugins doctor . --ci                 # registration contract
 hermes plugins validate .                    # catalog admission checks
 ```
@@ -317,9 +351,13 @@ from the protocol spec:
 | --- | --- | --- |
 | `SpecReceiver` | the send path | payload shape, session + token handling, pin gate (401), rejection (403), checksum mismatch (422), unreachable peer |
 | `spec_send` | the receive path | uploads landing on disk, wrong token (403), unknown session (409), size mismatch (400), checksum mismatch (422), never-overwrite |
+| `TlsSpecReceiver` | the send path over TLS | mandatory client auth, the announced fingerprint matching the certificate actually presented, refusal without an identity, pinning rejecting a wrong certificate |
+| its own receiver, over TLS | the receive path over TLS | the served certificate hashing to the announced fingerprint, a full transfer landing byte-exact, pinning, and a refused start leaving no port bound |
 
 Plus a **live multicast round-trip**: our announce is read off the group by a listener, the listener
-answers the way a real peer does, and the reply has to come back parsed as a peer.
+answers the way a real peer does, and the reply has to come back parsed as a peer. That one needs a host
+whose network loops multicast back to itself; a multi-homed Mac (a second interface on the same subnet)
+can drop local multicast even while unicast works, and it fails there rather than silently passing.
 
 The desktop half gets its own offline contract check — it stubs `@hermes/plugin-sdk`, `react` and
 `react/jsx-runtime`, imports the plugin, calls `register()`, then runs every `render()` in three
@@ -349,10 +387,10 @@ Every claim on this page was produced by running the thing, not by reading it. W
 
 ## Limits
 
-- **Encrypted peers are send-only for now.** Sending *to* a peer in LocalSend's default HTTPS mode
-  works (see [Encrypted peers](#encrypted-peers)); receiving from one still needs the receiver to serve
-  HTTPS with its own certificate request, which is not implemented. Announce HTTP to keep the receive
-  direction working, or turn the sender's encryption off.
+- **TLS receiving is server-authenticated only.** The receiver can serve TLS
+  ([Serving TLS](#serving-tls)) and a peer pins its certificate, but the sender's certificate is not
+  validated — stdlib Python cannot accept arbitrary self-signed client certificates, so LocalSend's
+  mandatory client-auth cannot be mirrored here. Use a `pin` when sender identity matters.
 - **Certificate generation uses `openssl`** for the HTTPS identity. It ships with macOS and virtually
   every Linux distribution; without it, sending to an encrypted peer reports a clear error instead of
   falling back to something weaker.

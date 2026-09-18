@@ -96,6 +96,14 @@ RECEIVE = {
                 "type": "integer",
                 "description": "Port to listen on (start only, default 53317 — the LocalSend default).",
             },
+            "https": {
+                "type": "boolean",
+                "description": (
+                    "Serve the receiver over TLS (start only, default from config). Peers that force "
+                    "encryption can then reach this machine. The certificate identifies the receiver; "
+                    "sender certificates are not validated (see README)."
+                ),
+            },
             "download_dir": {
                 "type": "string",
                 "description": "Directory for incoming files (start only, default from config).",

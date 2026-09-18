@@ -1145,6 +1145,142 @@ class PaneBackendContractTest(unittest.TestCase):
         self.assertEqual(missing, [], f"pane calls routes the backend does not serve: {missing} (serves {sorted(routes)})")
 
 
+class HttpsReceiverTest(unittest.TestCase):
+    """Serving TLS, so peers that force encryption can still reach this machine."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="ls-https-recv-")
+        self.identity_dir = os.path.join(self.tmp, "identity")
+        from hermes_localsend import certs as certs_module
+
+        self.receiver_certs = certs_module
+        self.identity = self.receiver_certs.generate(self.identity_dir)
+        self.server = None
+
+    def tearDown(self) -> None:
+        if self.server:
+            self.server.stop()
+
+    def bind_free_port(self) -> int:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def fetch_info_over_tls(self, port: int):
+        import http.client as http_client
+        import ssl as ssl_module
+
+        ctx = ssl_module._create_unverified_context()
+        conn = http_client.HTTPSConnection("127.0.0.1", port, timeout=6, context=ctx)
+        conn.request("GET", f"{API}/info")
+        response = conn.getresponse()
+        body = json.loads(response.read().decode() or "{}")
+        der = conn.sock.getpeercert(binary_form=True)
+        conn.close()
+        return response.status, body, der
+
+    def test_receiver_serves_tls_and_announces_it(self) -> None:
+        port = self.bind_free_port()
+        info = DeviceInfo(alias="TLS Receiver", port=port, protocol="https", fingerprint=self.identity.fingerprint)
+        self.server = ReceiveServer(info=info, download_dir=os.path.join(self.tmp, "inbox"), https=True, identity=self.identity)
+        detail = self.server.start()
+        self.assertIn("https", detail)
+        self.assertEqual(self.server.info.protocol, "https", "peers decide plain-vs-TLS from the announcement")
+
+        status, body, der = self.fetch_info_over_tls(port)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["protocol"], "https", body)
+        # what a peer pins us by must be the certificate it actually receives
+        self.assertEqual(
+            hashlib.sha256(der).hexdigest().upper(),
+            self.identity.fingerprint,
+            "announced fingerprint must match the served certificate",
+        )
+        self.assertEqual(body["fingerprint"], self.identity.fingerprint)
+
+    def test_send_to_a_tls_receiver_end_to_end(self) -> None:
+        port = self.bind_free_port()
+        info = DeviceInfo(alias="TLS Receiver", port=port, protocol="https", fingerprint=self.identity.fingerprint)
+        self.server = ReceiveServer(info=info, download_dir=os.path.join(self.tmp, "inbox"), https=True, identity=self.identity)
+        self.server.start()
+
+        sender_identity = self.receiver_certs.generate(os.path.join(self.tmp, "sender"))
+        protocol.set_identity(sender_identity)
+        self.addCleanup(lambda: setattr(protocol, "_identity", None))
+
+        source = os.path.join(self.tmp, "over-tls.bin")
+        with open(source, "wb") as fh:
+            fh.write(os.urandom(150_000))
+
+        peer = Peer(
+            alias="TLS Receiver",
+            ip="127.0.0.1",
+            port=port,
+            protocol="https",
+            fingerprint=self.identity.fingerprint,
+        )
+        result = protocol.send_files(
+            peer,
+            [source],
+            DeviceInfo(alias="Sender", protocol="https", fingerprint=sender_identity.fingerprint),
+        )
+        self.assertEqual(result["bytes"], 150_000, result)
+        self.assertEqual(len(self.server.received), 1, self.server.received)
+        record = self.server.received[0]
+        self.assertEqual(record["bytes"], 150_000)
+        self.assertEqual(record["sha256"], hashlib.sha256(open(source, "rb").read()).hexdigest())
+
+    def test_tls_receiver_refuses_a_mismatched_peer_certificate(self) -> None:
+        """Pinning still protects the sender when the receiver serves TLS."""
+        port = self.bind_free_port()
+        info = DeviceInfo(alias="TLS Receiver", port=port, protocol="https", fingerprint=self.identity.fingerprint)
+        self.server = ReceiveServer(info=info, download_dir=os.path.join(self.tmp, "inbox"), https=True, identity=self.identity)
+        self.server.start()
+
+        wrong = "AB" * 32
+        peer = Peer(alias="TLS Receiver", ip="127.0.0.1", port=port, protocol="https", fingerprint=wrong)
+        with self.assertRaises(LocalSendError) as ctx:
+            protocol.verify_peer_certificate(peer)
+        self.assertIn("mismatch", str(ctx.exception))
+
+    def test_tls_receiver_without_an_identity_is_refused_cleanly(self) -> None:
+        port = self.bind_free_port()
+        info = DeviceInfo(alias="TLS Receiver", port=port)
+        server = ReceiveServer(info=info, download_dir=os.path.join(self.tmp, "inbox"), https=True, identity=None)
+        with self.assertRaises(LocalSendError) as ctx:
+            server.start()
+        self.assertIn("certificate", str(ctx.exception).lower())
+        # a refused start must not leave the port bound
+        server.stop()
+        with socket.socket() as probe:
+            probe.settimeout(1.0)
+            self.assertNotEqual(probe.connect_ex(("127.0.0.1", port)), 0, "port left bound after a refused start")
+
+    def test_tool_receive_https_flag_reports_the_transport(self) -> None:
+        port = self.bind_free_port()
+        instance = plugin_tools.LocalSendTools(
+            FakeCtx(),
+            {
+                "port": port,
+                "alias": "Tool TLS",
+                "scan_subnets": False,
+                "identity_dir": self.identity_dir,
+                "inbox_dir": os.path.join(self.tmp, "tool-inbox"),
+            },
+        )
+        started = json.loads(instance.receive({"action": "start", "https": True}))
+        self.addCleanup(lambda: instance.receive({"action": "stop"}))
+        self.assertTrue(started["success"], started)
+        self.assertTrue(started["https"], started)
+        self.assertEqual(started["protocol"], "https", started)
+        self.assertEqual(started["identity_fingerprint"], self.identity.fingerprint, started)
+
+        status, body, _der = self.fetch_info_over_tls(port)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["protocol"], "https")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
