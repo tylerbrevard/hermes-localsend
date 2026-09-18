@@ -43,7 +43,10 @@ SEND = {
             "files": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Absolute paths of files to send.",
+                "description": (
+                    "Absolute paths of files to send. Must live under a share root "
+                    "(~/.hermes/media, ~/.hermes/output, the inbox, or a configured share_roots entry)."
+                ),
             },
             "text": {
                 "type": "string",
@@ -106,11 +109,14 @@ RECEIVE = {
             },
             "download_dir": {
                 "type": "string",
-                "description": "Directory for incoming files (start only, default from config).",
+                "description": "Directory for incoming files (start only, default from config; must be inside a share root).",
             },
             "pin": {
                 "type": "string",
-                "description": "Require this PIN from senders (start only; empty = no PIN).",
+                "description": (
+                    "Require this PIN from senders (start only). Empty = a random 6-digit PIN is generated "
+                    "and returned in the result."
+                ),
             },
         },
         "required": ["action"],

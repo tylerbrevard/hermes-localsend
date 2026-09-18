@@ -25,6 +25,11 @@ _SETTING_DEFAULTS = {
     "discovery_timeout_s": 3,
     "send_timeout_s": 120,
     "scan_subnets": True,
+    "identity_dir": "",
+    "receive_https": False,
+    "share_roots": [],
+    "allow_public_peers": False,
+    "max_transfer_bytes": 2 * 1024 ** 3,
 }
 
 

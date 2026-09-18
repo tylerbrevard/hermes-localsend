@@ -20,3 +20,6 @@ config_schema:
   scan_subnets: {type: bool, default: true, description: "Also probe the local /24 over HTTP when multicast is unavailable."}
   identity_dir: {type: str, default: "", description: "Where the device certificate for HTTPS peers lives (default ~/.hermes/localsend-identity)."}
   receive_https: {type: bool, default: false, description: "Serve the receiver over TLS so peers that force encryption can send to this machine."}
+  share_roots: {type: list, default: [], description: "Extra directories files may be sent from or received into (always: ~/.hermes/media, ~/.hermes/output, download_dir)."}
+  allow_public_peers: {type: bool, default: false, description: "Allow sending to a bare IP outside private/link-local/loopback ranges that discovery did not report."}
+  max_transfer_bytes: {type: int, default: 2147483648, description: "Largest upload (per file and per session) the receiver accepts; default 2 GiB."}
